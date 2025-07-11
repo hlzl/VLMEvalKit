@@ -5,9 +5,6 @@ from .base import BaseModel
 from ..smp import splitlen
 from PIL import Image
 
-import os
-import math
-
 
 class SmolVLM(BaseModel):
     INSTALL_REQ = True
@@ -25,9 +22,7 @@ class SmolVLM(BaseModel):
         kwargs_default = {"max_new_tokens": 2048, "use_cache": True}
         kwargs_default.update(kwargs)
         self.kwargs = kwargs_default
-        warnings.warn(
-            f"Following kwargs received: {self.kwargs}, will use as generation config."
-        )
+        warnings.warn(f"Following kwargs received: {self.kwargs}, will use as generation config.")
         torch.cuda.empty_cache()
 
     def generate_inner(self, message, dataset=None):
@@ -85,21 +80,35 @@ class SmolVLM(BaseModel):
             formatted_messages, formatted_images = self.build_prompt_default(message)
 
         images = (
-            [formatted_images]
-            if isinstance(formatted_images, Image.Image)
-            else formatted_images
+            [formatted_images] if isinstance(formatted_images, Image.Image) else formatted_images
         )
-        inputs = self.processor(
-            text=formatted_messages, images=images, return_tensors="pt"
-        )
+        inputs = self.processor(text=formatted_messages, images=images, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
         generated_ids = self.model.generate(**inputs, **self.kwargs)
         generated_text = self.processor.batch_decode(
-            generated_ids[:, inputs["input_ids"].size(1):], skip_special_tokens=True
+            generated_ids[:, inputs["input_ids"].size(1) :], skip_special_tokens=True
         )[0]
 
-        return generated_text.strip()
+        # NOTE: Custom adapation to request logits and hidden states
+        # Resize default longest edge 2048 and crop to 512^2 + 1 downsample to 512^2
+        # Shape [num subimages, num patches, hidden dim] for default patch size 64^2
+        with torch.no_grad():
+            # Full VLM
+            # img_embeddings = self.model(**inputs, output_hidden_states=True, return_dict=True)[
+            #     "image_hidden_states"
+            # ]
+            # Image encoder only
+            img_embeddings = self.model.model.vision_model(
+                inputs["pixel_values"][0], output_hidden_states=True, return_dict=True
+            )["last_hidden_state"]
+            connector_output = self.model.model.connector(
+                self.model.model.vision_model(
+                    inputs["pixel_values"][0], output_hidden_states=True, return_dict=True
+                )["last_hidden_state"]
+            )
+
+        return generated_text.strip(), img_embeddings, connector_output
 
     def build_prompt_default(self, message, add_brief=False, add_yes_or_no=False):
         from transformers.image_utils import load_image
@@ -180,9 +189,7 @@ class SmolVLM(BaseModel):
                 if instruction.startswith("Hint:"):
                     hint, question = instruction.split("\nQuestion:")
                     question, choices = question.split("\nChoices:")
-                    instruction = (
-                        "Question:" + question + "\n" + hint + "\nChoices:" + choices
-                    )
+                    instruction = "Question:" + question + "\n" + hint + "\nChoices:" + choices
                 prompt += instruction
         prompt += "<end_of_utterance>\nAssistant: Answer:"
         return prompt, images
@@ -324,28 +331,23 @@ class SmolVLM(BaseModel):
     def chat_inner(self, message, dataset=None):
         formatted_messages, formatted_images = self.build_prompt_mt(message)
         images = (
-            [formatted_images]
-            if isinstance(formatted_images, Image.Image)
-            else formatted_images
+            [formatted_images] if isinstance(formatted_images, Image.Image) else formatted_images
         )
 
         resulting_messages = [
             {
                 "role": "user",
-                "content": [{"type": "image"}]
-                + [{"type": "text", "text": formatted_messages}],
+                "content": [{"type": "image"}] + [{"type": "text", "text": formatted_messages}],
             }
         ]
-        prompt = self.processor.apply_chat_template(
-            resulting_messages, add_generation_prompt=True
-        )
+        prompt = self.processor.apply_chat_template(resulting_messages, add_generation_prompt=True)
 
         inputs = self.processor(text=prompt, images=images, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
         generated_ids = self.model.generate(**inputs, **self.kwargs)
         generated_text = self.processor.batch_decode(
-            generated_ids[:, inputs["input_ids"].size(1):], skip_special_tokens=True
+            generated_ids[:, inputs["input_ids"].size(1) :], skip_special_tokens=True
         )[0]
 
         return generated_text.strip()
@@ -379,9 +381,7 @@ class SmolVLM2(BaseModel):
         kwargs_default = {"max_new_tokens": 2048, "do_sample": False, "use_cache": True}
         kwargs_default.update(kwargs)
         self.kwargs = kwargs_default
-        warnings.warn(
-            f"Following kwargs received: {self.kwargs}, will use as generation config."
-        )
+        warnings.warn(f"Following kwargs received: {self.kwargs}, will use as generation config.")
         torch.cuda.empty_cache()
 
     def generate_inner(self, message, dataset=None):
@@ -449,33 +449,41 @@ class SmolVLM2(BaseModel):
             "Video-MME",
             "LongVideoBench",
         ]:
-            formatted_messages, formatted_images = self.build_prompt_video(
-                message, dataset
-            )
+            formatted_messages, formatted_images = self.build_prompt_video(message, dataset)
         else:
             formatted_messages, formatted_images = self.build_prompt_default(message)
 
         # Convert to list if single image
         images = (
-            [formatted_images]
-            if isinstance(formatted_images, Image.Image)
-            else formatted_images
+            [formatted_images] if isinstance(formatted_images, Image.Image) else formatted_images
         )
 
         # Process text and images directly
-        inputs = self.processor(
-            text=formatted_messages, images=images, return_tensors="pt"
-        ).to(self.model.device)
+        inputs = self.processor(text=formatted_messages, images=images, return_tensors="pt").to(
+            self.model.device
+        )
 
         # Generate response
         generated_ids = self.model.generate(**inputs, **self.kwargs)
 
         # Decode only the new tokens, not the entire sequence
         generated_text = self.processor.batch_decode(
-            generated_ids[:, inputs["input_ids"].size(1):], skip_special_tokens=True
+            generated_ids[:, inputs["input_ids"].size(1) :], skip_special_tokens=True
         )[0]
 
-        return generated_text.strip()
+        # NOTE: Custom adapation to request logits and hidden states
+        with torch.no_grad():
+            # Image encoder only
+            img_embeddings = self.model.model.vision_model(
+                inputs["pixel_values"][0], output_hidden_states=True, return_dict=True
+            )["last_hidden_state"]
+            connector_output = self.model.model.connector(
+                self.model.model.vision_model(
+                    inputs["pixel_values"][0], output_hidden_states=True, return_dict=True
+                )["last_hidden_state"]
+            )
+
+        return generated_text.strip(), img_embeddings, connector_output
 
     def build_prompt_default(self, message, add_brief=False, add_yes_or_no=False):
         from transformers.image_utils import load_image
@@ -521,11 +529,7 @@ class SmolVLM2(BaseModel):
 
         # Find system message first
         system_message = next(
-            (
-                msg
-                for msg in message
-                if msg["type"] == "text" and msg.get("role") == "system"
-            ),
+            (msg for msg in message if msg["type"] == "text" and msg.get("role") == "system"),
             None,
         )
 
@@ -545,9 +549,7 @@ class SmolVLM2(BaseModel):
             )
 
         # Add User prefix
-        prompt_parts.extend(
-            ["<|im_start|>User:", "Here are some frames sampled from a video:\n"]
-        )
+        prompt_parts.extend(["<|im_start|>User:", "Here are some frames sampled from a video:\n"])
 
         # Process image blocks
         text_messages = []
@@ -560,9 +562,7 @@ class SmolVLM2(BaseModel):
                 if current_block:
                     image_blocks.append(current_block)
                     current_block = []
-                if (
-                    msg.get("role") != "system"
-                ):  # Skip system message as it's already added
+                if msg.get("role") != "system":  # Skip system message as it's already added
                     text_messages.append(msg)
 
         if current_block:
@@ -578,9 +578,7 @@ class SmolVLM2(BaseModel):
                 block_timestamps = [f"{i // 60:02}:{i % 60:02}" for i in frame_indices]
             else:
                 trimmed_block = block
-                block_timestamps = [
-                    f"{i // 60:02}:{i % 60:02}" for i in range(len(block))
-                ]
+                block_timestamps = [f"{i // 60:02}:{i % 60:02}" for i in range(len(block))]
 
             # Add frames with optional timestamps
             for img, ts in zip(trimmed_block, block_timestamps):
@@ -703,9 +701,7 @@ class SmolVLM2(BaseModel):
                 if instruction.startswith("Hint:"):
                     hint, question = instruction.split("\nQuestion:")
                     question, choices = question.split("\nChoices:")
-                    instruction = (
-                        "Question:" + question + "\n" + hint + "\nChoices:" + choices
-                    )
+                    instruction = "Question:" + question + "\n" + hint + "\nChoices:" + choices
                 prompt += instruction
         prompt += "<end_of_utterance>\nAssistant: Answer:"
         return prompt, images
@@ -848,22 +844,20 @@ class SmolVLM2(BaseModel):
         # Use the same build_prompt_mt method as in SmolVLM
         formatted_messages, formatted_images = self.build_prompt_mt(message)
         images = (
-            [formatted_images]
-            if isinstance(formatted_images, Image.Image)
-            else formatted_images
+            [formatted_images] if isinstance(formatted_images, Image.Image) else formatted_images
         )
 
         # Process text and images directly
-        inputs = self.processor(
-            text=formatted_messages, images=images, return_tensors="pt"
-        ).to(self.model.device)
+        inputs = self.processor(text=formatted_messages, images=images, return_tensors="pt").to(
+            self.model.device
+        )
 
         # Generate response
         generated_ids = self.model.generate(**inputs, **self.kwargs)
 
         # Decode only the new tokens, not the entire sequence
         generated_text = self.processor.batch_decode(
-            generated_ids[:, inputs["input_ids"].size(1):], skip_special_tokens=True
+            generated_ids[:, inputs["input_ids"].size(1) :], skip_special_tokens=True
         )[0]
 
         return generated_text.strip()
