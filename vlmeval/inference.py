@@ -1,58 +1,64 @@
+# pyright: reportGeneralTypeIssues=false
 import torch
 import torch.distributed as dist
+import joblib  # for saving embeddings and connector outputs
 from vlmeval.config import supported_VLM
 from vlmeval.utils import track_progress_rich
 from vlmeval.smp import *
 
-FAIL_MSG = 'Failed to obtain answer via API.'
+FAIL_MSG = "Failed to obtain answer via API."
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, nargs='+', required=True)
-    parser.add_argument('--model', type=str, nargs='+', required=True)
-    parser.add_argument('--nproc', type=int, default=4, required=True)
-    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument("--data", type=str, nargs="+", required=True)
+    parser.add_argument("--model", type=str, nargs="+", required=True)
+    parser.add_argument("--nproc", type=int, default=4, required=True)
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     return args
 
 
 # Only API model is accepted
-def infer_data_api(model, work_dir, model_name, dataset, index_set=None, api_nproc=4, ignore_failed=False):
+def infer_data_api(
+    model, work_dir, model_name, dataset, index_set=None, api_nproc=4, ignore_failed=False
+):
     rank, world_size = get_rank_and_world_size()
     assert rank == 0 and world_size == 1
     dataset_name = dataset.dataset_name
     data = dataset.data
     if index_set is not None:
-        data = data[data['index'].isin(index_set)]
+        data = data[data["index"].isin(index_set)]
 
     model = supported_VLM[model_name]() if isinstance(model, str) else model
-    assert getattr(model, 'is_api', False)
-    if hasattr(model, 'set_dump_image'):
+    assert getattr(model, "is_api", False)
+    if hasattr(model, "set_dump_image"):
         model.set_dump_image(dataset.dump_image)
 
-    lt, indices = len(data), list(data['index'])
+    lt, indices = len(data), list(data["index"])
 
     structs = []
     for i in range(lt):
         item = data.iloc[i]
-        if hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
-            assert hasattr(model, 'build_prompt')
+        if hasattr(model, "use_custom_prompt") and model.use_custom_prompt(dataset_name):
+            assert hasattr(model, "build_prompt")
             struct = model.build_prompt(item, dataset=dataset_name)
         else:
             struct = dataset.build_prompt(item)
         structs.append(struct)
 
-    out_file = f'{work_dir}/{model_name}_{dataset_name}_supp.pkl'
+    out_file = f"{work_dir}/{model_name}_{dataset_name}_supp.pkl"
 
     # To reuse records in MMBench_V11
-    if dataset_name in ['MMBench', 'MMBench_CN']:
-        v11_pred = f'{work_dir}/{model_name}_{dataset_name}_V11.xlsx'
+    if dataset_name in ["MMBench", "MMBench_CN"]:
+        v11_pred = f"{work_dir}/{model_name}_{dataset_name}_V11.xlsx"
         if osp.exists(v11_pred):
             try:
-                reuse_inds = load('http://opencompass.openxlab.space/utils/mmb_reuse.pkl')
+                reuse_inds = load("http://opencompass.openxlab.space/utils/mmb_reuse.pkl")
                 data = load(v11_pred)
-                ans_map = {x: y for x, y in zip(data['index'], data['prediction']) if x in reuse_inds}
+                ans_map = {
+                    x: y for x, y in zip(data["index"], data["prediction"]) if x in reuse_inds
+                }
                 dump(ans_map, out_file)
             except Exception as err:
                 print(type(err), err)
@@ -70,7 +76,9 @@ def infer_data_api(model, work_dir, model_name, dataset, index_set=None, api_npr
     structs = [dict(message=struct, dataset=dataset_name) for struct in structs]
 
     if len(structs):
-        track_progress_rich(gen_func, structs, nproc=api_nproc, chunksize=api_nproc, save=out_file, keys=indices)
+        track_progress_rich(
+            gen_func, structs, nproc=api_nproc, chunksize=api_nproc, save=out_file, keys=indices
+        )
 
     res = load(out_file)
     if index_set is not None:
@@ -79,9 +87,11 @@ def infer_data_api(model, work_dir, model_name, dataset, index_set=None, api_npr
     return res
 
 
-def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, api_nproc=4, use_vllm=False):
+def infer_data(
+    model, model_name, work_dir, dataset, out_file, verbose=False, api_nproc=4, use_vllm=False
+):
     dataset_name = dataset.dataset_name
-    prev_file = f'{work_dir}/{model_name}_{dataset_name}_PREV.pkl'
+    prev_file = f"{work_dir}/{model_name}_{dataset_name}_PREV.pkl"
     res = load(prev_file) if osp.exists(prev_file) else {}
     if osp.exists(out_file):
         res.update(load(out_file))
@@ -90,12 +100,12 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     sheet_indices = list(range(rank, len(dataset), world_size))
     lt = len(sheet_indices)
     data = dataset.data.iloc[sheet_indices]
-    data_indices = [i for i in data['index']]
+    data_indices = [i for i in data["index"]]
 
     # If finished, will exit without building the model
     all_finished = True
     for i in range(lt):
-        idx = data.iloc[i]['index']
+        idx = data.iloc[i]["index"]  # type: ignore
         if idx not in res:
             all_finished = False
     if all_finished:
@@ -104,36 +114,35 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         return model
 
     # Data need to be inferred
-    data = data[~data['index'].isin(res)]
+    data = data[~data["index"].isin(res)]
     lt = len(data)
 
     kwargs = {}
     if model_name is not None and (
-        'Llama-4' in model_name
-        or 'Qwen2-VL' in model_name
-        or 'Qwen2.5-VL' in model_name
+        "Llama-4" in model_name or "Qwen2-VL" in model_name or "Qwen2.5-VL" in model_name
     ):
-        kwargs = {'use_vllm': use_vllm}
+        kwargs = {"use_vllm": use_vllm}
 
     # (25.06.05) In newer version of transformers (after 4.50), with device_map='auto' and torchrun launcher,
     # Transformers automatically adopt TP parallelism, which leads to compatibility problems with VLMEvalKit
     # (In VLMEvalKit, we use torchrun to launch multiple model instances on a single node).
     # To bypass this problem, we unset `WORLD_SIZE` before building the model to not use TP parallel.
-    ws_bak = os.environ.pop('WORLD_SIZE', None)
+    ws_bak = os.environ.pop("WORLD_SIZE", None)
     model = supported_VLM[model_name](**kwargs) if isinstance(model, str) else model
     if ws_bak:
-        os.environ['WORLD_SIZE'] = ws_bak
+        os.environ["WORLD_SIZE"] = ws_bak
 
-    is_api = getattr(model, 'is_api', False)
+    is_api = getattr(model, "is_api", False)
     if is_api:
-        lt, indices = len(data), list(data['index'])
+        lt, indices = len(data), list(data["index"])
         supp = infer_data_api(
             model=model,
             work_dir=work_dir,
             model_name=model_name,
             dataset=dataset,
             index_set=set(indices),
-            api_nproc=api_nproc)
+            api_nproc=api_nproc,
+        )
         for idx in indices:
             assert idx in supp
         res.update(supp)
@@ -143,25 +152,33 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     else:
         model.set_dump_image(dataset.dump_image)
 
-    for i in tqdm(range(lt), desc=f'Infer {model_name}/{dataset_name}, Rank {rank}/{world_size}'):
-        idx = data.iloc[i]['index']
+    # ----------------------------------------------------------------------------------
+    # Prepare a dict to collect the extra outputs (img_embeddings & connector_output)
+    # for each processed sample so we can persist them after the loop. We will store a
+    # per-rank file similar to how prediction pickles are handled so that downstream
+    # aggregation (if needed) can follow the existing pattern.
+    # ----------------------------------------------------------------------------------
+    extra_outputs = {}
+
+    for i in tqdm(range(lt), desc=f"Infer {model_name}/{dataset_name}, Rank {rank}/{world_size}"):
+        idx = data.iloc[i]["index"]  # type: ignore
         if idx in res:
             continue
 
-        if hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
+        if hasattr(model, "use_custom_prompt") and model.use_custom_prompt(dataset_name):
             struct = model.build_prompt(data.iloc[i], dataset=dataset_name)
         else:
             struct = dataset.build_prompt(data.iloc[i])
 
         # If `SKIP_ERR` flag is set, the model will skip the generation if error is encountered
-        if os.environ.get('SKIP_ERR', False) == '1':
-            FAIL_MSG = 'Failed to obtain answer'
+        if os.environ.get("SKIP_ERR", False) == "1":
+            FAIL_MSG = "Failed to obtain answer"
             try:
                 response = model.generate(message=struct, dataset=dataset_name)
             except RuntimeError as err:
                 torch.cuda.synchronize()
-                warnings.warn(f'{type(err)} {str(err)}')
-                response = f'{FAIL_MSG}: {type(err)} {str(err)}'
+                warnings.warn(f"{type(err)} {str(err)}")
+                response = f"{FAIL_MSG}: {type(err)} {str(err)}"
         else:
             response = model.generate(message=struct, dataset=dataset_name)
         torch.cuda.empty_cache()
@@ -173,36 +190,81 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         if (i + 1) % 10 == 0:
             dump(res, out_file)
 
+        # NOTE: our adapted output has 3 elements and not only response
+        if len(response) > 1:
+            response, img_embeddings, connector_output = response
+
+            # ----------------------------------------------------------------------
+            # Persist additional outputs so they can be analysed later. We also store
+            # some meta information (sample name & image_path) for convenience.
+            # ----------------------------------------------------------------------
+            row = data.iloc[i]
+            sample_name = str(row.get("name", idx))  # fallback to idx if name missing
+            image_path = row.get("image_path", row.get("image", None))
+
+            extra_outputs[sample_name] = {
+                "name": sample_name,
+                "image_path": image_path,
+                "img_embeddings": img_embeddings,
+                "connector_output": connector_output,
+            }
+
     res = {k: res[k] for k in data_indices}
     dump(res, out_file)
+
+    # ------------------------------------------------------------------------------
+    # Dump the collected embeddings/connector outputs. We follow the same per-rank
+    # file naming convention as `out_file` so that higher-level aggregation can be
+    # done analogously if needed.
+    # ------------------------------------------------------------------------------
+    embed_file = out_file.replace(".pkl", "_embed.pkl")
+    try:
+        joblib.dump(extra_outputs, embed_file)
+    except Exception as e:
+        warnings.warn(f"Failed to save embeddings to {embed_file}: {e}")
+
     return model
 
 
 # A wrapper for infer_data, do the pre & post processing
 def infer_data_job(
-    model, work_dir, model_name, dataset, verbose=False, api_nproc=4, ignore_failed=False, use_vllm=False
+    model,
+    work_dir,
+    model_name,
+    dataset,
+    verbose=False,
+    api_nproc=4,
+    ignore_failed=False,
+    use_vllm=False,
 ):
     rank, world_size = get_rank_and_world_size()
     dataset_name = dataset.dataset_name
-    result_file = osp.join(work_dir, f'{model_name}_{dataset_name}.xlsx')
+    result_file = osp.join(work_dir, f"{model_name}_{dataset_name}.xlsx")
 
-    prev_file = f'{work_dir}/{model_name}_{dataset_name}_PREV.pkl'
+    prev_file = f"{work_dir}/{model_name}_{dataset_name}_PREV.pkl"
     if osp.exists(result_file):
         if rank == 0:
             data = load(result_file)
-            results = {k: v for k, v in zip(data['index'], data['prediction'])}
+            results = {k: v for k, v in zip(data["index"], data["prediction"])}
             if not ignore_failed:
                 results = {k: v for k, v in results.items() if FAIL_MSG not in str(v)}
             dump(results, prev_file)
         if world_size > 1:
             dist.barrier()
 
-    tmpl = osp.join(work_dir, '{}' + f'{world_size}_{dataset_name}.pkl')
+    tmpl = osp.join(work_dir, "{}" + f"{world_size}_{dataset_name}.pkl")
     out_file = tmpl.format(rank)
 
     model = infer_data(
-        model=model, work_dir=work_dir, model_name=model_name, dataset=dataset,
-        out_file=out_file, verbose=verbose, api_nproc=api_nproc, use_vllm=use_vllm)
+        model=model,
+        work_dir=work_dir,
+        model_name=model_name,
+        dataset=dataset,
+        out_file=out_file,
+        verbose=verbose,
+        api_nproc=api_nproc,
+        use_vllm=use_vllm,
+    )
     if world_size > 1:
         dist.barrier()
 
@@ -212,11 +274,11 @@ def infer_data_job(
             data_all.update(load(tmpl.format(i)))
 
         data = dataset.data
-        for x in data['index']:
+        for x in data["index"]:  # type: ignore
             assert x in data_all
-        data['prediction'] = [str(data_all[x]) for x in data['index']]
-        if 'image' in data:
-            data.pop('image')
+        data["prediction"] = [str(data_all[x]) for x in data["index"]]  # type: ignore
+        if "image" in data:
+            data.pop("image")
 
         dump(data, result_file)
         for i in range(world_size):
