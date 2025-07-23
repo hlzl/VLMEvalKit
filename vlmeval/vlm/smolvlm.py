@@ -68,13 +68,17 @@ class SmolVLM(BaseModel):
             formatted_messages, formatted_images = self.build_prompt_default(
                 message, add_yes_or_no=True
             )
-        elif dataset in [
-            "MMStar",
-            "SEEDBench_IMG",
-            "AI2D_TEST",
-            "ScienceQA_VAL",
-            "ScienceQA_TEST",
-        ]:
+        elif (
+            dataset
+            in [
+                "MMStar",
+                "SEEDBench_IMG",
+                "AI2D_TEST",
+                "ScienceQA_VAL",
+                "ScienceQA_TEST",
+            ]
+            or "AI2D" in dataset  # custom
+        ):
             formatted_messages, formatted_images = self.build_prompt_puremcq(message)
         else:
             formatted_messages, formatted_images = self.build_prompt_default(message)
